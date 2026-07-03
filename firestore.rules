@@ -1,0 +1,137 @@
+rules_version = '2';
+
+// See DESIGN.md §5.2/§6 and CLAUDE.md "Non-negotiable architectural rules"
+// in the out-coached (Android) repo for the rationale behind every check
+// here. Money math, settlement, ledger, and leaderboard writes are
+// Cloud-Functions-only (Admin SDK bypasses these rules entirely) — this
+// file's job is to make sure a client can never forge the inputs those
+// functions trust: timestamps, wager history, and play state.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function game(gameId) {
+      return get(/databases/$(database)/documents/games/$(gameId)).data;
+    }
+
+    function gameExists(gameId) {
+      return exists(/databases/$(database)/documents/games/$(gameId));
+    }
+
+    function isOperator(gameId) {
+      return isSignedIn() && gameExists(gameId)
+        && request.auth.uid in game(gameId).operatorUids;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // ---- games/{gameId} ---------------------------------------------
+    // Game creation/config is an admin operation (console or an admin
+    // script — see scripts/seed-game.ts) for now. No client, operator
+    // included, writes top-level game fields; operatorUids and config
+    // are trust anchors every other rule in this file reads from.
+    match /games/{gameId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+
+      // ---- games/{gameId}/plays/{playId} -----------------------------
+      // Phase 1 (no settlement function yet): the operator drives
+      // open -> locked (SNAP) and locked -> voided directly, and writes
+      // the result once it's known. Once the settlement function ships
+      // (DESIGN.md §9 step 2), it takes over play creation and the
+      // settling/settled transition via the Admin SDK; client rules
+      // below never grant those two states.
+      match /plays/{playId} {
+        allow read: if isSignedIn();
+
+        // Operator opens the very first play / a fresh play after a
+        // void, before any settlement function exists to do it.
+        allow create: if isOperator(gameId)
+          && request.resource.data.state == 'open'
+          && request.resource.data.openedAt == request.time;
+
+        // SNAP (open -> locked), VOID (open|locked -> voided), and
+        // result entry (locked, result written once) are the only
+        // client-writable transitions. 'settling' and 'settled' are
+        // never accepted from a client.
+        allow update: if isOperator(gameId) && (
+          // SNAP
+          (resource.data.state == 'open'
+            && request.resource.data.state == 'locked'
+            && request.resource.data.snapAt == request.time)
+          ||
+          // VOID
+          (resource.data.state in ['open', 'locked']
+            && request.resource.data.state == 'voided')
+          ||
+          // Result entry: state unchanged, only `result` is being set.
+          (resource.data.state == 'locked'
+            && request.resource.data.state == 'locked'
+            && request.resource.data.result != null)
+        );
+
+        allow delete: if false;
+
+        // ---- .../wagers/{revisionId} — APPEND-ONLY ------------------
+        match /wagers/{revisionId} {
+          allow read: if isSignedIn();
+
+          allow create: if isSelf(request.resource.data.playerUid)
+            && !(request.auth.uid in game(gameId).operatorUids)
+            && get(/databases/$(database)/documents/games/$(gameId)/plays/$(playId)).data.state == 'open'
+            && request.resource.data.placedAt == request.time
+            && request.resource.data.typePick in ['run', 'pass']
+            && request.resource.data.bucketPick in
+                 game(gameId).config.buckets[request.resource.data.typePick]
+            && request.resource.data.typeStake is int && request.resource.data.typeStake >= 0
+            && request.resource.data.resultStake is int && request.resource.data.resultStake >= 0
+            && (request.resource.data.typeStake + request.resource.data.resultStake) <=
+                 get(/databases/$(database)/documents/games/$(gameId)/players/$(request.auth.uid)).data.balance;
+
+          // Revisions are immutable once written.
+          allow update, delete: if false;
+        }
+      }
+
+      // ---- games/{gameId}/players/{uid} -------------------------------
+      match /players/{uid} {
+        allow read: if isSignedIn();
+
+        // A player joins by creating their own doc, seeded at the
+        // game's configured grubstake — never a client-chosen balance.
+        allow create: if isSelf(uid)
+          && request.resource.data.balance == game(gameId).config.grubstake
+          && request.resource.data.stats.typeBets == 0
+          && request.resource.data.stats.typeCorrect == 0
+          && request.resource.data.stats.typeWrong == 0
+          && request.resource.data.stats.resultCorrect == 0;
+
+        // Display name is the only thing a player can change themselves;
+        // balance and stats move only through ledger-writing functions.
+        allow update: if isSelf(uid)
+          && request.resource.data.balance == resource.data.balance
+          && request.resource.data.stats == resource.data.stats;
+
+        allow delete: if false;
+      }
+
+      // ---- games/{gameId}/ledger/{playId_uid} — function-only, APPEND-ONLY
+      match /ledger/{entryId} {
+        allow read: if isSignedIn() && request.auth.uid == resource.data.playerUid;
+        allow write: if false;
+      }
+
+      // ---- games/{gameId}/public/leaderboard — function-only ----------
+      match /public/{docId} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+    }
+  }
+}

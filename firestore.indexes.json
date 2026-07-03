@@ -1,0 +1,13 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "wagers",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "playerUid", "order": "ASCENDING" },
+        { "fieldPath": "placedAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
