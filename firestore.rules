@@ -38,7 +38,18 @@ service cloud.firestore {
     // are trust anchors every other rule in this file reads from.
     match /games/{gameId} {
       allow read: if isSignedIn();
-      allow write: if false;
+      allow create, delete: if false;
+
+      // Operators may advance period/status markers (DESIGN.md §3, end of
+      // quarter/half/game, OT) and, in phase 1 only, `currentPlayId` — once
+      // the settlement function ships it owns that field and this branch's
+      // `currentPlayId` clause can be dropped. `config` and `operatorUids`
+      // are trust anchors: never client-writable, operator included.
+      allow update: if isOperator(gameId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['period', 'status', 'currentPlayId'])
+        && request.resource.data.config == resource.data.config
+        && request.resource.data.operatorUids == resource.data.operatorUids;
 
       // ---- games/{gameId}/plays/{playId} -----------------------------
       // Phase 1 (no settlement function yet): the operator drives
