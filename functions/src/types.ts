@@ -82,6 +82,7 @@ export interface LedgerEntry {
   balanceAfter: number;
   reason: LedgerReason;
   playerUid: string;
+  playId: string;
   createdAt: Timestamp;
 }
 

@@ -41,31 +41,26 @@ service cloud.firestore {
       allow create, delete: if false;
 
       // Operators may advance period/status markers (DESIGN.md §3, end of
-      // quarter/half/game, OT) and, in phase 1 only, `currentPlayId` — once
-      // the settlement function ships it owns that field and this branch's
-      // `currentPlayId` clause can be dropped. `config` and `operatorUids`
-      // are trust anchors: never client-writable, operator included.
+      // quarter/half/game, OT). `currentPlayId` is settlement-function-only
+      // as of phase 2 (settlePlay / advanceAfterVoid / undoLastSettlement
+      // own it via the Admin SDK) — never client-writable, operator
+      // included, same as `config` and `operatorUids`.
       allow update: if isOperator(gameId)
         && request.resource.data.diff(resource.data).affectedKeys()
-             .hasOnly(['period', 'status', 'currentPlayId'])
+             .hasOnly(['period', 'status'])
         && request.resource.data.config == resource.data.config
         && request.resource.data.operatorUids == resource.data.operatorUids;
 
       // ---- games/{gameId}/plays/{playId} -----------------------------
-      // Phase 1 (no settlement function yet): the operator drives
-      // open -> locked (SNAP) and locked -> voided directly, and writes
-      // the result once it's known. Once the settlement function ships
-      // (DESIGN.md §9 step 2), it takes over play creation and the
-      // settling/settled transition via the Admin SDK; client rules
-      // below never grant those two states.
+      // Play creation is Admin-SDK-only as of phase 2 (the settlement/void
+      // functions open each next play; the very first play of a game comes
+      // from an admin/seed path, e.g. scripts/seedGame.ts) — no client
+      // `create` here. The operator drives open -> locked (SNAP),
+      // open|locked -> voided, and writes the result once it's known;
+      // 'settling' and 'settled' are never accepted from a client.
       match /plays/{playId} {
         allow read: if isSignedIn();
-
-        // Operator opens the very first play / a fresh play after a
-        // void, before any settlement function exists to do it.
-        allow create: if isOperator(gameId)
-          && request.resource.data.state == 'open'
-          && request.resource.data.openedAt == request.time;
+        allow create: if false;
 
         // SNAP (open -> locked), VOID (open|locked -> voided), and
         // result entry (locked, result written once) are the only
