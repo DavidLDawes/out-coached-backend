@@ -7,21 +7,43 @@ its own repo because it's a different toolchain (TypeScript/Node vs. the
 Android app's Kotlin/Gradle) with its own deploy path (`firebase deploy` vs.
 an app release) — see the design doc discussion for the tradeoffs.
 
-**Status: phase 1 (skeleton) — schema + rules only, no Cloud Functions logic
-yet.** Money math (settlement, refund/void, undo) is phase 2.
+**Status: phase 2 (money) deployed and live.** Settlement, void-advance, and
+undo Cloud Functions are running against the real `out-coached` Firebase
+project on the Blaze plan. Phase 3 (leaderboard doc + screens, FCM) is next.
+
+Runtime: Node.js 22 (see `functions/.nvmrc` / `functions/package.json`
+`engines.node`).
 
 ## Layout
 
 ```
-firebase.json           firebase.json config
+firebase.json            firebase.json config
 firestore.rules          Security rules — see comments inline, and
                           DESIGN.md §5.2/§6 for the "why"
 firestore.indexes.json   Composite indexes
 functions/                Cloud Functions (TypeScript)
-  src/types.ts            Schema types mirroring DESIGN.md §6
-  src/index.ts             Function exports (currently just a smoke-test ping)
-  src/scripts/seedGame.ts Dev-only emulator seed script
+  src/types.ts             Schema types mirroring DESIGN.md §6
+  src/settlement.ts        Pure parimutuel math (unit tested, no Firebase deps)
+  src/settlement.test.ts   Vitest — worked examples from DESIGN.md §4.3
+  src/index.ts             settlePlay / advanceAfterVoid / undoLastSettlement / ping
+  src/scripts/seedGame.ts  Dev-only emulator seed script
+.github/workflows/
+  ci.yml                   Build + test on every PR
+  deploy.yml               Build + test + deploy on push to main
 ```
+
+## CI/CD
+
+`deploy.yml` runs on every push to `main`: builds, runs the vitest suite,
+then deploys Firestore rules/indexes/functions to the live `out-coached`
+project — authenticated via a dedicated GCP service account
+(`github-deploy@out-coached.iam.gserviceaccount.com`) whose key is stored as
+the `GCP_SA_KEY` repo secret. That service account holds exactly the roles
+Cloud Functions Gen2 deploys need (Firebase Admin, Cloud Functions Admin,
+Cloud Run Admin, Artifact Registry Admin, Eventarc Admin, Pub/Sub Admin,
+Cloud Build Editor, Service Account User, Storage Admin) — nothing broader.
+Rotate the key via `gcloud iam service-accounts keys create` + re-running
+`gh secret set GCP_SA_KEY` if it's ever suspected compromised.
 
 ## Setup
 
@@ -58,6 +80,6 @@ firebase deploy --only firestore:rules,firestore:indexes,functions
 
 ## Build order
 
-See DESIGN.md §9. This repo currently implements step 1 (schema + rules).
-Step 2 (settlement Cloud Function, parimutuel math, ledger, refund/void/undo,
-with unit tests against the worked examples in DESIGN.md §4.3) is next.
+See DESIGN.md §9. Steps 1 (schema + rules) and 2 (settlement Cloud Function,
+parimutuel math, ledger, refund/void/undo) are done and deployed. Step 3
+(leaderboard doc + screens, result animations, FCM game-start pings) is next.
