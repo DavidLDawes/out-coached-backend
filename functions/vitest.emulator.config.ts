@@ -1,0 +1,10 @@
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    include: ["src/**/*.emulator.test.ts"],
+    // Emulator round-trips are slower than the pure-math suite; give them room.
+    testTimeout: 20_000,
+    hookTimeout: 20_000,
+  },
+});

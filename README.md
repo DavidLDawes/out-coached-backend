@@ -25,7 +25,9 @@ functions/                Cloud Functions (TypeScript)
   src/types.ts             Schema types mirroring DESIGN.md §6
   src/settlement.ts        Pure parimutuel math (unit tested, no Firebase deps)
   src/settlement.test.ts   Vitest — worked examples from DESIGN.md §4.3
-  src/index.ts             settlePlay / advanceAfterVoid / undoLastSettlement / ping
+  src/handlers.ts          settlePlay/advanceAfterVoid/undoLastSettlement logic
+  src/handlers.emulator.test.ts  Integration tests against the real Firestore emulator
+  src/index.ts             Thin trigger/callable wrappers around handlers.ts + ping
   src/scripts/seedGame.ts  Dev-only emulator seed script
 .github/workflows/
   ci.yml                   Build + test on every PR
@@ -53,6 +55,17 @@ npm install -g firebase-tools   # if not already installed
 firebase login
 cp ../.firebaserc.example ../.firebaserc   # then edit in your project id
 ```
+
+## Testing
+
+```
+npx vitest run          # pure math (settlement.ts) — instant, no emulator needed
+npm run test:emulator   # handlers.ts against a real Firestore emulator
+```
+
+`test:emulator` requires **JDK 21+** (the Firestore emulator jar itself
+needs it — separate from whatever JDK you use for other projects). Both
+suites run in CI on every PR and before every deploy.
 
 ## Local development (emulators)
 
