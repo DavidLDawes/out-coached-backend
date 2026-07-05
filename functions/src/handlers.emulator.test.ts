@@ -8,7 +8,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { beforeEach, describe, expect, it } from "vitest";
 import { advanceAfterVoidHandler, settlePlayHandler, undoLastSettlementHandler } from "./handlers";
 import { clearFirestoreEmulator, getTestFirestore } from "./emulator-test-utils";
-import type { Game, LedgerEntry, Play, Player } from "./types";
+import type { Game, LedgerEntry, Leaderboard, Play, Player } from "./types";
 
 const db = getTestFirestore();
 const GAME_ID = "test-game";
@@ -91,6 +91,11 @@ async function getLedgerEntries(playId: string): Promise<LedgerEntry[]> {
   return snap.docs.map((d) => d.data() as LedgerEntry);
 }
 
+async function getLeaderboard(): Promise<Leaderboard | undefined> {
+  const snap = await db.doc(`games/${GAME_ID}/public/leaderboard`).get();
+  return snap.data() as Leaderboard | undefined;
+}
+
 beforeEach(async () => {
   await clearFirestoreEmulator();
 });
@@ -134,6 +139,15 @@ describe("settlePlayHandler", () => {
     expect(ledger).toHaveLength(4);
     expect(ledger.find((e) => e.playerUid === "A")?.delta).toBe(166);
     expect(ledger.find((e) => e.playerUid === "C")?.delta).toBe(-200);
+
+    // DESIGN.md §8: recomputed as part of settlement.
+    const leaderboard = await getLeaderboard();
+    expect(leaderboard?.topBalance[0].uid).toBe("A");
+    expect(leaderboard?.topBalance[0].balance).toBe(1166);
+    expect(leaderboard?.accuracy.mode).toBe("top5"); // only 4 players total, well under the perfect-count threshold
+    expect(leaderboard?.accuracy.entries?.map((e) => e.uid).sort()).toEqual(["A", "B", "C", "D"]);
+    expect(leaderboard?.accuracy.entries?.find((e) => e.uid === "A")?.wrong).toBe(0);
+    expect(leaderboard?.accuracy.entries?.find((e) => e.uid === "C")?.wrong).toBe(1);
   });
 
   it("excludes a wager revision placed after the retroactive cutoff", async () => {
@@ -244,6 +258,10 @@ describe("undoLastSettlementHandler", () => {
     expect(play.settlement?.reversedBy).toBeTruthy();
 
     expect((await getGame()).currentPlayId).toBe("0001");
+
+    // DESIGN.md §8: recomputed after undo too, since stats reverted.
+    const leaderboard = await getLeaderboard();
+    expect(leaderboard?.accuracy.entries?.every((e) => e.wrong === 0)).toBe(true);
   });
 
   it("rejects a non-operator", async () => {
