@@ -5,13 +5,37 @@
 
 import { FieldValue, Firestore, Timestamp } from "firebase-admin/firestore";
 import { HttpsError } from "firebase-functions/v2/https";
+import { logger } from "firebase-functions/v2";
 import { adjacentPlayId, clampStakeToBalance, computeSettlement, selectCountedWagers } from "./settlement";
+import { computeAccuracy, computeTopBalance, type PlayerSummary } from "./leaderboard";
 import type { Game, LedgerEntry, Play, Player, WagerRevision } from "./types";
 
 function chunk<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
   for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
   return chunks;
+}
+
+/**
+ * DESIGN.md §8 — recomputed after every settlement and every undo (stats
+ * change either way). A full players-collection scan; fine at the ~500
+ * players/game scale DESIGN.md §5.3 sizes this for.
+ */
+async function recomputeLeaderboard(firestore: Firestore, gameId: string): Promise<void> {
+  const gameRef = firestore.doc(`games/${gameId}`);
+  const playersSnap = await gameRef.collection("players").get();
+  const summaries: PlayerSummary[] = playersSnap.docs.map((doc) => {
+    const data = doc.data() as Player;
+    return { uid: doc.id, name: data.displayName, balance: data.balance, typeWrong: data.stats.typeWrong };
+  });
+
+  await gameRef.collection("public").doc("leaderboard").set({
+    topBalance: computeTopBalance(summaries),
+    accuracy: computeAccuracy(summaries),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  logger.info("Leaderboard recomputed", { gameId, playerCount: summaries.length });
 }
 
 /**
@@ -42,7 +66,11 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
     tx.update(playRef, { state: "settling" });
     return true;
   });
-  if (!claimed) return;
+  if (!claimed) {
+    logger.info("settlePlayHandler: no-op (already claimed/settled or state moved on)", { gameId, playId });
+    return;
+  }
+  logger.info("settlePlayHandler: claimed", { gameId, playId });
 
   const game = (await gameRef.get()).data() as Game | undefined;
   if (!game) throw new Error(`Game ${gameId} not found while settling ${playId}.`);
@@ -65,6 +93,12 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
   });
   const counted = selectCountedWagers(revisions, cutoffAt.toMillis());
   const uids = [...counted.keys()];
+  logger.info("settlePlayHandler: wagers counted", {
+    gameId,
+    playId,
+    revisionCount: revisions.length,
+    countedCount: uids.length,
+  });
 
   const playerRefs = new Map(uids.map((uid) => [uid, gameRef.collection("players").doc(uid)] as const));
   const playerSnaps = await Promise.all(uids.map((uid) => playerRefs.get(uid)!.get()));
@@ -76,6 +110,15 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
   );
 
   const summary = computeSettlement(clampedWagers, play.result!);
+  logger.info("settlePlayHandler: settlement computed", {
+    gameId,
+    playId,
+    result: play.result,
+    typePool: summary.typePool,
+    resultPool: summary.resultPool,
+    typeWinners: summary.typeWinners,
+    resultWinners: summary.resultWinners,
+  });
 
   for (const batchPlayers of chunk(summary.players, 200)) {
     const batch = firestore.batch();
@@ -124,6 +167,9 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
     await nextPlayRef.set({ state: "open", openedAt: FieldValue.serverTimestamp() });
   }
   await gameRef.update({ currentPlayId: nextPlayId });
+
+  await recomputeLeaderboard(firestore, gameId);
+  logger.info("settlePlayHandler: done", { gameId, playId, nextPlayId });
 }
 
 /**
@@ -135,16 +181,23 @@ export async function advanceAfterVoidHandler(firestore: Firestore, gameId: stri
   const gameRef = firestore.doc(`games/${gameId}`);
   const nextPlayId = adjacentPlayId(playId, 1)!;
 
-  await firestore.runTransaction(async (tx) => {
+  const advanced = await firestore.runTransaction(async (tx) => {
     const gameSnap = await tx.get(gameRef);
     const game = gameSnap.data() as Game | undefined;
-    if (!game || game.currentPlayId !== playId) return; // already advanced past this void
+    if (!game || game.currentPlayId !== playId) return false; // already advanced past this void
 
     tx.set(gameRef.collection("plays").doc(nextPlayId), {
       state: "open",
       openedAt: FieldValue.serverTimestamp(),
     });
     tx.update(gameRef, { currentPlayId: nextPlayId });
+    return true;
+  });
+
+  logger.info(advanced ? "advanceAfterVoidHandler: advanced" : "advanceAfterVoidHandler: no-op", {
+    gameId,
+    playId,
+    nextPlayId,
   });
 }
 
@@ -167,14 +220,17 @@ export async function undoLastSettlementHandler(
   const game = (await gameRef.get()).data() as Game | undefined;
   if (!game) throw new HttpsError("not-found", "Game not found.");
   if (!game.operatorUids.includes(uid)) {
+    logger.warn("undoLastSettlementHandler: rejected non-operator", { gameId, playId, uid });
     throw new HttpsError("permission-denied", "Only operators may undo a settlement.");
   }
 
   const play = (await playRef.get()).data() as Play | undefined;
   if (!play || play.state !== "settled" || !play.settlement || !play.result) {
+    logger.warn("undoLastSettlementHandler: rejected, play not settled", { gameId, playId, state: play?.state });
     throw new HttpsError("failed-precondition", "Play is not in a settled state.");
   }
   if (play.settlement.reversedBy) {
+    logger.warn("undoLastSettlementHandler: rejected, already undone", { gameId, playId });
     throw new HttpsError("failed-precondition", "This play was already undone.");
   }
 
@@ -182,6 +238,12 @@ export async function undoLastSettlementHandler(
   if (nextPlayId) {
     const next = (await gameRef.collection("plays").doc(nextPlayId).get()).data() as Play | undefined;
     if (next && next.state !== "open") {
+      logger.warn("undoLastSettlementHandler: rejected, later play already progressed", {
+        gameId,
+        playId,
+        nextPlayId,
+        nextState: next.state,
+      });
       throw new HttpsError(
         "failed-precondition",
         "A later play has already progressed — only the latest play is undoable here.",
@@ -242,6 +304,9 @@ export async function undoLastSettlementHandler(
   });
   finalBatch.update(gameRef, { currentPlayId: playId });
   await finalBatch.commit();
+
+  await recomputeLeaderboard(firestore, gameId);
+  logger.info("undoLastSettlementHandler: done", { gameId, playId, uid, undone: ledgerSnap.size });
 
   return { undone: ledgerSnap.size };
 }
