@@ -7,9 +7,18 @@ its own repo because it's a different toolchain (TypeScript/Node vs. the
 Android app's Kotlin/Gradle) with its own deploy path (`firebase deploy` vs.
 an app release) — see the design doc discussion for the tradeoffs.
 
-**Status: phase 2 (money) deployed and live.** Settlement, void-advance, and
-undo Cloud Functions are running against the real `out-coached` Firebase
-project on the Blaze plan. Phase 3 (leaderboard doc + screens, FCM) is next.
+**Status: phases 2 and 3 deployed and live.** Settlement, void-advance, and
+undo Cloud Functions run against the real `out-coached` Firebase project on
+the Blaze plan; leaderboard recomputation and FCM game-live notifications
+(`notifications.ts`) are also deployed. Remaining work (DESIGN.md §9 step 4,
+a live dry run against a real broadcast) lives entirely on the Android/
+operator side — nothing further is planned for this repo before that.
+
+The Android app also gained a monetization layer (AdMob ads, a one-time
+premium ad-removal purchase, GDPR/UMP consent — see the out-coached repo's
+DESIGN.md §10). **That is entirely client-side and out of scope for this
+repo** — no billing/ads/consent data is ever sent to Firestore or Cloud
+Functions, and it should stay that way; see this repo's CLAUDE.md.
 
 Runtime: Node.js 22 (see `functions/.nvmrc` / `functions/package.json`
 `engines.node`).
@@ -93,6 +102,7 @@ firebase deploy --only firestore:rules,firestore:indexes,functions
 
 ## Build order
 
-See DESIGN.md §9. Steps 1 (schema + rules) and 2 (settlement Cloud Function,
-parimutuel math, ledger, refund/void/undo) are done and deployed. Step 3
-(leaderboard doc + screens, result animations, FCM game-start pings) is next.
+See DESIGN.md §9. Steps 1 (schema + rules), 2 (settlement Cloud Function,
+parimutuel math, ledger, refund/void/undo), and 3 (leaderboard recomputation,
+FCM game-start pings) are done and deployed. Step 4 (a live dry run against a
+real broadcast) is the only step left, and it doesn't touch this repo.
