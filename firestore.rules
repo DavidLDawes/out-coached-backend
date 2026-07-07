@@ -31,6 +31,30 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == uid;
     }
 
+    // ---- Crowd-run games (DESIGN.md §12) -----------------------------
+    function crowdEnabled(gameId) {
+      return game(gameId).config.get('crowdMode', 'off') != 'off';
+    }
+
+    // §12.6 eligibility: crowd reports require a real (non-anonymous)
+    // identity. Stake-on-pool eligibility can't be checked cheaply here —
+    // it's enforced at tally time in the Cloud Function instead.
+    function isGoogleLinked() {
+      return isSignedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    // §12.2 state gates — a momentType only counts while the game is in the
+    // specific preceding state that signal is valid for.
+    function momentGateOpen(gameId, t) {
+      return (t == 'kickoff' && game(gameId).status == 'scheduled')
+        || (t == 'end_q1' && game(gameId).status == 'live' && game(gameId).period == 'Q1')
+        || (t == 'half' && game(gameId).status == 'live' && game(gameId).period == 'Q2')
+        || (t == 'end_q3' && game(gameId).status == 'live' && game(gameId).period == 'Q3')
+        || (t in ['start_ot', 'end_game'] && game(gameId).status == 'live'
+              && game(gameId).period in ['Q4', 'OT'])
+        || (t in ['commercial_enter', 'commercial_exit'] && game(gameId).status == 'live');
+    }
+
     // ---- games/{gameId} ---------------------------------------------
     // Game creation/config is an admin operation (console or an admin
     // script — see scripts/seed-game.ts) for now. No client, operator
@@ -103,6 +127,53 @@ service cloud.firestore {
           // Revisions are immutable once written.
           allow update, delete: if false;
         }
+
+        // ---- .../reports/{reportId} — APPEND-ONLY (§12.2/§12.3) -------
+        // Snap presses while the play is OPEN; type/result votes once it's
+        // LOCKED. Values are validated against the config buckets the same
+        // way wagers are. Google-linked identities only (§12.6).
+        match /reports/{reportId} {
+          allow read: if isSignedIn();
+
+          allow create: if isSelf(request.resource.data.playerUid)
+            && crowdEnabled(gameId)
+            && isGoogleLinked()
+            && request.resource.data.reportedAt == request.time
+            && request.resource.data.phase in ['snap', 'type', 'result']
+            && (
+              (request.resource.data.phase == 'snap'
+                && get(/databases/$(database)/documents/games/$(gameId)/plays/$(playId)).data.state == 'open')
+              ||
+              (request.resource.data.phase in ['type', 'result']
+                && get(/databases/$(database)/documents/games/$(gameId)/plays/$(playId)).data.state == 'locked')
+            )
+            && (request.resource.data.phase != 'type'
+                || request.resource.data.value in ['run', 'pass'])
+            && (request.resource.data.phase != 'result'
+                || request.resource.data.value in game(gameId).config.buckets.run
+                || request.resource.data.value in game(gameId).config.buckets.pass);
+
+          allow update, delete: if false;
+        }
+      }
+
+      // ---- games/{gameId}/momentSignals/{signalId} — APPEND-ONLY (§12.2)
+      match /momentSignals/{signalId} {
+        allow read: if isSignedIn();
+
+        allow create: if isSelf(request.resource.data.playerUid)
+          && crowdEnabled(gameId)
+          && isGoogleLinked()
+          && request.resource.data.signaledAt == request.time
+          && momentGateOpen(gameId, request.resource.data.momentType);
+
+        allow update, delete: if false;
+      }
+
+      // ---- games/{gameId}/shadowDecisions — function-only (§12, shadow mode)
+      match /shadowDecisions/{decisionId} {
+        allow read: if isSignedIn();
+        allow write: if false;
       }
 
       // ---- games/{gameId}/players/{uid} -------------------------------
@@ -111,12 +182,19 @@ service cloud.firestore {
 
         // A player joins by creating their own doc, seeded at the
         // game's configured grubstake — never a client-chosen balance.
+        // §12.10: scheduled games are joinable only once the join window
+        // opens (scheduledStartAt − joinWindowSeconds); games without a
+        // scheduledStartAt are joinable any time, as before.
         allow create: if isSelf(uid)
           && request.resource.data.balance == game(gameId).config.grubstake
           && request.resource.data.stats.typeBets == 0
           && request.resource.data.stats.typeCorrect == 0
           && request.resource.data.stats.typeWrong == 0
-          && request.resource.data.stats.resultCorrect == 0;
+          && request.resource.data.stats.resultCorrect == 0
+          && (!('scheduledStartAt' in game(gameId))
+              || request.time.toMillis() >=
+                   game(gameId).scheduledStartAt.toMillis()
+                     - game(gameId).config.get('joinWindowSeconds', 300) * 1000);
 
         // Display name is the only thing a player can change themselves;
         // balance and stats move only through ledger-writing functions.
