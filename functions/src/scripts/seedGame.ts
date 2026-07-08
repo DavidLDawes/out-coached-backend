@@ -47,6 +47,10 @@ async function main() {
         ],
       },
       bustedTopUp: true,
+      // DESIGN.md §12 — crowd-run rollout gate. "off" keeps the seeded dev
+      // game operator-driven; flip to "shadow"/"live" to exercise the crowd
+      // path locally. Tunables not set here resolve to CROWD_DEFAULTS.
+      crowdMode: "off",
     },
     currentPlayId: "0001",
     period: "Q1",

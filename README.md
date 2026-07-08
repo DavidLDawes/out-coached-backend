@@ -31,13 +31,26 @@ firestore.rules          Security rules — see comments inline, and
                           DESIGN.md §5.2/§6 for the "why"
 firestore.indexes.json   Composite indexes
 functions/                Cloud Functions (TypeScript)
-  src/types.ts             Schema types mirroring DESIGN.md §6
+  src/types.ts             Schema types mirroring DESIGN.md §6 (+§12.5)
   src/settlement.ts        Pure parimutuel math (unit tested, no Firebase deps)
   src/settlement.test.ts   Vitest — worked examples from DESIGN.md §4.3
   src/handlers.ts          settlePlay/advanceAfterVoid/undoLastSettlement logic
+                            (+ the §12.4 reporting-accuracy ledger step)
   src/handlers.emulator.test.ts  Integration tests against the real Firestore emulator
-  src/index.ts             Thin trigger/callable wrappers around handlers.ts + ping
+  src/crowd/               DESIGN.md §12 pure decision logic (no Firebase deps),
+                            each with an exhaustive unit-test file:
+    burst.ts                 §12.2 moment-signal burst detection
+    consensus.ts             §12.3 vote tallying + finalize rule
+    quorum.ts                §12.6 quorum scaling + margin acceptance
+    reportingLedger.ts       §12.4 reward/penalty table
+    config.ts                §12.5 tunables + defaults resolver
+  src/crowdHandlers.ts     Crowd-run trigger logic: snap/kickoff/period bursts,
+                            type/result votes, holds, sweep, scheduleGame,
+                            monitor actions (PLAN.md CR-2)
+  src/crowdHandlers.emulator.test.ts  Full crowd-run plays against the emulator
+  src/index.ts             Thin trigger/callable wrappers around handlers + ping
   src/scripts/seedGame.ts  Dev-only emulator seed script
+  src/scripts/grantMonitor.ts  Grants/revokes the §12.9 monitor custom claim
 .github/workflows/
   ci.yml                   Build + test on every PR
   deploy.yml               Build + test + deploy on push to main

@@ -6,9 +6,18 @@
 import { FieldValue, Firestore, Timestamp } from "firebase-admin/firestore";
 import { HttpsError } from "firebase-functions/v2/https";
 import { logger } from "firebase-functions/v2";
-import { adjacentPlayId, clampStakeToBalance, computeSettlement, selectCountedWagers } from "./settlement";
+import { adjacentPlayId, clampStakeToBalance, computeSettlement, selectCountedWagers, type CountedWager } from "./settlement";
 import { computeAccuracy, computeTopBalance, type PlayerSummary } from "./leaderboard";
-import type { Game, LedgerEntry, Play, Player, WagerRevision } from "./types";
+import { latestPerUid } from "./crowd/consensus";
+import { resolveCrowdConfig } from "./crowd/config";
+import {
+  evaluateResultReport,
+  evaluateTypeReport,
+  passLadderOf,
+  type ReportingOutcome,
+  type ResultDistanceContext,
+} from "./crowd/reportingLedger";
+import type { CrowdReport, Game, LedgerEntry, Play, Player, WagerRevision } from "./types";
 
 function chunk<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -36,6 +45,103 @@ async function recomputeLeaderboard(firestore: Firestore, gameId: string): Promi
   });
 
   logger.info("Leaderboard recomputed", { gameId, playerCount: summaries.length });
+}
+
+/**
+ * DESIGN.md §12.4 — the reporting-accuracy ledger step, run inside
+ * settlement once the official result is known. Rewards reporters who
+ * agreed with the crowd's official outcome; penalizes self-serving
+ * disagreement (far miss matching the reporter's own wager). Idempotent via
+ * an existing-entries check keyed on the reporting ledger doc IDs, since
+ * these writes use balance increments rather than absolute values.
+ */
+async function applyReportingLedger(
+  firestore: Firestore,
+  gameId: string,
+  playId: string,
+  game: Game,
+  result: { type: "run" | "pass"; bucket: string },
+  counted: Map<string, CountedWager>,
+  settledBalances: Map<string, number>,
+): Promise<void> {
+  const gameRef = firestore.doc(`games/${gameId}`);
+  const playRef = gameRef.collection("plays").doc(playId);
+  const reportsSnap = await playRef.collection("reports").get();
+  if (reportsSnap.empty) return;
+
+  const crowd = resolveCrowdConfig(game.config);
+  if (crowd.crowdMode !== "live") return;
+
+  const reports = reportsSnap.docs.map((d) => d.data() as CrowdReport);
+  const ctx: ResultDistanceContext = {
+    runLadder: game.config.buckets.run,
+    passLadder: passLadderOf(game.config.buckets.pass, crowd.passCategoricalBuckets),
+    passCategorical: crowd.passCategoricalBuckets,
+    adjacency: crowd.passBucketAdjacency,
+  };
+
+  const outcomes: { outcome: ReportingOutcome; pool: "type" | "result" }[] = [];
+  for (const pool of ["type", "result"] as const) {
+    const latest = latestPerUid(
+      reports
+        .filter((r) => r.phase === pool)
+        .map((r) => ({ uid: r.playerUid, value: r.value, atMillis: r.reportedAt.toMillis() })),
+    );
+    for (const report of latest.values()) {
+      const wager = counted.get(report.uid);
+      // §12.6 eligibility: only reporters with an active stake on this pool.
+      if (!wager || (pool === "type" ? wager.typeStake : wager.resultStake) <= 0) continue;
+      const outcome =
+        pool === "type"
+          ? evaluateTypeReport(
+              { uid: report.uid, reportedValue: report.value, wagerPick: wager.typePick },
+              result.type,
+              crowd.reportingBonusCredits,
+            )
+          : evaluateResultReport(
+              { uid: report.uid, reportedValue: report.value, wagerPick: wager.bucketPick },
+              result.bucket,
+              result.type,
+              ctx,
+              crowd.reportingBonusCredits,
+            );
+      if (outcome) outcomes.push({ outcome, pool });
+    }
+  }
+  if (outcomes.length === 0) return;
+
+  // Idempotency: skip anything already written (increments would otherwise
+  // double-apply on a retried settlement).
+  const existingSnap = await gameRef
+    .collection("ledger")
+    .where("playId", "==", playId)
+    .where("reason", "in", ["reporting_bonus", "reporting_penalty"])
+    .get();
+  const existingIds = new Set(existingSnap.docs.map((d) => d.id));
+
+  for (const batchOutcomes of chunk(outcomes, 200)) {
+    const batch = firestore.batch();
+    for (const { outcome, pool } of batchOutcomes) {
+      const docId = `${playId}_${outcome.uid}_reporting_${pool}`;
+      if (existingIds.has(docId)) continue;
+      const balanceAfter = (settledBalances.get(outcome.uid) ?? 0) + outcome.delta;
+      settledBalances.set(outcome.uid, balanceAfter);
+      batch.update(gameRef.collection("players").doc(outcome.uid), {
+        balance: FieldValue.increment(outcome.delta),
+      });
+      const entry: LedgerEntry = {
+        delta: outcome.delta,
+        balanceAfter,
+        reason: outcome.reason,
+        playerUid: outcome.uid,
+        playId,
+        createdAt: FieldValue.serverTimestamp() as unknown as Timestamp,
+      };
+      batch.set(gameRef.collection("ledger").doc(docId), entry);
+    }
+    await batch.commit();
+  }
+  logger.info("applyReportingLedger: done", { gameId, playId, outcomeCount: outcomes.length });
 }
 
 /**
@@ -145,6 +251,14 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
     await batch.commit();
   }
 
+  // DESIGN.md §12.4 — reporting-accuracy bonuses/penalties, applied on top
+  // of the settlement deltas. No-op for operator-driven games (no reports).
+  const settledBalances = new Map(balances);
+  for (const p of summary.players) {
+    settledBalances.set(p.playerUid, (settledBalances.get(p.playerUid) ?? 0) + p.delta);
+  }
+  await applyReportingLedger(firestore, gameId, playId, game, play.result!, clampedWagers, settledBalances);
+
   await playRef.update({
     state: "settled",
     cutoffAt,
@@ -213,13 +327,16 @@ export async function undoLastSettlementHandler(
   gameId: string,
   playId: string,
   uid: string,
+  isMonitor = false,
 ): Promise<{ undone: number }> {
   const gameRef = firestore.doc(`games/${gameId}`);
   const playRef = gameRef.collection("plays").doc(playId);
 
   const game = (await gameRef.get()).data() as Game | undefined;
   if (!game) throw new HttpsError("not-found", "Game not found.");
-  if (!game.operatorUids.includes(uid)) {
+  // §12.9: undo authority is the monitor claim under crowd operation;
+  // operatorUids keeps working for operator-driven games during transition.
+  if (!isMonitor && !game.operatorUids.includes(uid)) {
     logger.warn("undoLastSettlementHandler: rejected non-operator", { gameId, playId, uid });
     throw new HttpsError("permission-denied", "Only operators may undo a settlement.");
   }
@@ -251,10 +368,12 @@ export async function undoLastSettlementHandler(
     }
   }
 
+  // Reporting bonuses/penalties (§12.4) ride the same play, so undo reverses
+  // them alongside the settlement entries.
   const ledgerSnap = await gameRef
     .collection("ledger")
     .where("playId", "==", playId)
-    .where("reason", "==", "settlement")
+    .where("reason", "in", ["settlement", "reporting_bonus", "reporting_penalty"])
     .get();
 
   const wagersSnap = await playRef.collection("wagers").get();
@@ -271,17 +390,23 @@ export async function undoLastSettlementHandler(
     const batch = firestore.batch();
     for (const doc of batchDocs) {
       const entry = doc.data() as LedgerEntry;
-      const wager = latestWagerByPlayer.get(entry.playerUid);
-      const typeCorrect = wager?.typePick === play.result!.type;
-      const resultCorrect = typeCorrect && wager?.bucketPick === play.result!.bucket;
-
-      batch.update(gameRef.collection("players").doc(entry.playerUid), {
-        balance: FieldValue.increment(-entry.delta),
-        "stats.typeBets": FieldValue.increment(-1),
-        "stats.typeCorrect": FieldValue.increment(typeCorrect ? -1 : 0),
-        "stats.typeWrong": FieldValue.increment(typeCorrect ? 0 : -1),
-        "stats.resultCorrect": FieldValue.increment(resultCorrect ? -1 : 0),
-      });
+      if (entry.reason === "settlement") {
+        const wager = latestWagerByPlayer.get(entry.playerUid);
+        const typeCorrect = wager?.typePick === play.result!.type;
+        const resultCorrect = typeCorrect && wager?.bucketPick === play.result!.bucket;
+        batch.update(gameRef.collection("players").doc(entry.playerUid), {
+          balance: FieldValue.increment(-entry.delta),
+          "stats.typeBets": FieldValue.increment(-1),
+          "stats.typeCorrect": FieldValue.increment(typeCorrect ? -1 : 0),
+          "stats.typeWrong": FieldValue.increment(typeCorrect ? 0 : -1),
+          "stats.resultCorrect": FieldValue.increment(resultCorrect ? -1 : 0),
+        });
+      } else {
+        // Reporting entries carry no stats — reverse the balance only.
+        batch.update(gameRef.collection("players").doc(entry.playerUid), {
+          balance: FieldValue.increment(-entry.delta),
+        });
+      }
 
       const undoEntry: LedgerEntry = {
         delta: -entry.delta,
@@ -291,7 +416,7 @@ export async function undoLastSettlementHandler(
         playId,
         createdAt: FieldValue.serverTimestamp() as unknown as Timestamp,
       };
-      batch.set(gameRef.collection("ledger").doc(`${playId}_${entry.playerUid}_undo`), undoEntry);
+      batch.set(gameRef.collection("ledger").doc(`${doc.id}_undo`), undoEntry);
     }
     await batch.commit();
   }
