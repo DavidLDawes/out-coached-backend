@@ -11,6 +11,7 @@
     "build:watch": "tsc --watch",
     "serve": "npm run build && firebase emulators:start --only functions,firestore,auth",
     "seed": "ts-node src/scripts/seedGame.ts",
+    "e2e": "ts-node src/scripts/e2eCrowdGame.ts",
     "test": "vitest run",
     "test:emulator": "firebase emulators:exec --only firestore \"vitest run --config vitest.emulator.config.ts\""
   },
