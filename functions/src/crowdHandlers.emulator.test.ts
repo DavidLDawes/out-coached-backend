@@ -587,4 +587,17 @@ describe("scheduleGame (§12.10 / §11.7)", () => {
       scheduleGameHandler(db, { gameId: "a b!", scheduledStartAtMillis: 1 }, "scheduler-1", true),
     ).rejects.toThrow(/gameId/);
   });
+
+  it("rejects an out-of-bounds config override", async () => {
+    await expect(
+      scheduleGameHandler(
+        db,
+        { gameId: "bad-config", scheduledStartAtMillis: 1, config: { grubstake: -5 } },
+        "scheduler-1",
+        true,
+      ),
+    ).rejects.toThrow(/grubstake/);
+
+    expect((await db.doc("games/bad-config").get()).exists).toBe(false);
+  });
 });

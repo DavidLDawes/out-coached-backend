@@ -13,7 +13,8 @@ Firebase backend (Firestore rules + Cloud Functions, TypeScript/Node) for
 Android app into its own repo because it's a different toolchain with its
 own deploy path (`firebase deploy` vs. an app release). Phases 1–3 of the
 build order are done and deployed to the live `out-coached` Firebase project
-on the Blaze plan: schema/rules, settlement/void/undo, and leaderboard/FCM.
+on the Blaze plan: schema/rules, settlement/void/undo, and leaderboard/FCM —
+as is the crowd-run backend (DESIGN.md §12, `crowdHandlers.ts`).
 
 **Not real-money gambling.** Credits only, no cash-out. If that ever changes,
 stop and re-read DESIGN.md's legal note before touching settlement code.
@@ -50,9 +51,10 @@ anywhere else in the project.
 7. **Outcome buckets come from game config, not code.** Settlement reads
    `games/{gameId}.config.buckets`; never hardcode a bucket list in
    `settlement.ts` or `handlers.ts`.
-8. **The operator cannot be a player-with-stakes in the same game.** Enforced
-   in `firestore.rules`: a uid in `operatorUids` may not hold a player doc
-   with nonzero stakes in that game.
+8. **The operator cannot be a player in the same game.** Enforced in
+   `firestore.rules`: a uid in `operatorUids` may not create a `players` doc
+   in that game at all (so it can't wager), independent of `operatorUids`
+   being edited later.
 
 ## Conventions
 
@@ -66,9 +68,9 @@ anywhere else in the project.
   action (settle, void, undo) should log outcome, not just failure.
 - Test both ways: `npx vitest run` for pure math (instant), `npm run
   test:emulator` for `handlers.ts` against a real Firestore emulator (needs
-  JDK 21+, separate from any other JDK on the machine). Both run in CI on
-  every PR and before every deploy (`.github/workflows/ci.yml` /
-  `deploy.yml`).
+  JDK 21+, separate from any other JDK on the machine). `npm run lint` too
+  (ESLint flat config, `eslint.config.mjs`). All three run in CI on every PR
+  and before every deploy (`.github/workflows/ci.yml` / `deploy.yml`).
 - Deploys run on push to `main` via a dedicated least-privilege GCP service
   account (`github-deploy@out-coached.iam.gserviceaccount.com`, key in the
   `GCP_SA_KEY` repo secret) — don't broaden its roles without a reason.

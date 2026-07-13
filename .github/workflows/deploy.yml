@@ -27,6 +27,7 @@ jobs:
           java-version: "21"
 
       - run: npm ci
+      - run: npm run lint
       - run: npm run build
       - run: npx vitest run
       - run: npm install -g firebase-tools

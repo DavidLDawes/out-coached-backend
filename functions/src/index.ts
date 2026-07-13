@@ -14,7 +14,7 @@ import {
   sweepCrowdGames,
   type ScheduleGameArgs,
 } from "./crowdHandlers";
-import { sendGameLiveNotification } from "./notifications";
+import { isFirstGoingLive, sendGameLiveNotification } from "./notifications";
 import type { Game, MomentSignal, Play } from "./types";
 
 initializeApp();
@@ -69,15 +69,24 @@ export const advanceAfterVoid = onDocumentUpdated("games/{gameId}/plays/{playId}
 });
 
 /**
- * DESIGN.md §5.1/§9 step 3: pings the game's FCM topic the moment status
- * flips to "live" — the Android app subscribes to `game_{gameId}` on join.
+ * DESIGN.md §5.1/§9 step 3: pings the game's FCM topic the moment the game
+ * *first* goes live — the Android app subscribes to `game_{gameId}` on join.
+ * Only the initial scheduled/undefined -> live transition qualifies; a crowd
+ * game also goes halftime -> live at the second-half snap
+ * (crowdHandlers.ts), which is not a "come watch, it's starting" moment and
+ * would otherwise double-notify players already in the game.
  */
 export const notifyGameLive = onDocumentUpdated("games/{gameId}", async (event) => {
   const before = event.data?.before.data() as Game | undefined;
   const after = event.data?.after.data() as Game | undefined;
   const { gameId } = event.params as { gameId: string };
 
-  if (before?.status === "live" || after?.status !== "live") return;
+  if (!isFirstGoingLive(before?.status, after?.status)) {
+    if (before?.status === "halftime" && after?.status === "live") {
+      logger.debug("notifyGameLive: suppressed duplicate push at second-half snap", { gameId });
+    }
+    return;
+  }
 
   logger.info("notifyGameLive triggered", { gameId });
   try {

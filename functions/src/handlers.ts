@@ -67,10 +67,16 @@ async function applyReportingLedger(
   const gameRef = firestore.doc(`games/${gameId}`);
   const playRef = gameRef.collection("plays").doc(playId);
   const reportsSnap = await playRef.collection("reports").get();
-  if (reportsSnap.empty) return;
+  if (reportsSnap.empty) {
+    logger.info("applyReportingLedger: skip, no reports on this play", { gameId, playId });
+    return;
+  }
 
   const crowd = resolveCrowdConfig(game.config);
-  if (crowd.crowdMode !== "live") return;
+  if (crowd.crowdMode !== "live") {
+    logger.info("applyReportingLedger: skip, crowdMode is not live", { gameId, playId, crowdMode: crowd.crowdMode });
+    return;
+  }
 
   const reports = reportsSnap.docs.map((d) => d.data() as CrowdReport);
   const ctx: ResultDistanceContext = {
@@ -108,7 +114,10 @@ async function applyReportingLedger(
       if (outcome) outcomes.push({ outcome, pool });
     }
   }
-  if (outcomes.length === 0) return;
+  if (outcomes.length === 0) {
+    logger.info("applyReportingLedger: skip, no eligible reporting outcomes", { gameId, playId });
+    return;
+  }
 
   // Idempotency: skip anything already written (increments would otherwise
   // double-apply on a retried settlement).
@@ -118,6 +127,13 @@ async function applyReportingLedger(
     .where("reason", "in", ["reporting_bonus", "reporting_penalty"])
     .get();
   const existingIds = new Set(existingSnap.docs.map((d) => d.id));
+  if (existingIds.size > 0) {
+    logger.warn("applyReportingLedger: skipping outcomes already written by a prior attempt", {
+      gameId,
+      playId,
+      alreadyWrittenCount: existingIds.size,
+    });
+  }
 
   for (const batchOutcomes of chunk(outcomes, 200)) {
     const batch = firestore.batch();
@@ -155,10 +171,19 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
   // Atomically claim the settlement: only one invocation can win the
   // locked -> settling transition. Also enforces CLAUDE.md rule #5 — a play
   // cannot settle before the previous one has settled or been voided.
-  const claimed = await firestore.runTransaction(async (tx) => {
+  //
+  // A play already in "settling" is treated as a recovery, not a no-op: if a
+  // prior invocation died between claiming (this transaction) and the final
+  // `settled` write below, there is no automatic retry (Gen2 triggers here
+  // aren't configured with retry: true), and the play would otherwise be
+  // stuck forever. Every write between claim and the final state transition
+  // is idempotent (deterministic ledger doc IDs, absolute balance/state
+  // values), so re-running the whole body from "settling" is safe.
+  const claim = await firestore.runTransaction(async (tx) => {
     const snap = await tx.get(playRef);
     const data = snap.data() as Play | undefined;
-    if (!data || data.state !== "locked" || !data.result) return false;
+    if (data?.state === "settling") return "recovering" as const;
+    if (!data || data.state !== "locked" || !data.result) return "skip" as const;
 
     const prevId = adjacentPlayId(playId, -1);
     if (prevId) {
@@ -170,13 +195,17 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
     }
 
     tx.update(playRef, { state: "settling" });
-    return true;
+    return "claimed" as const;
   });
-  if (!claimed) {
+  if (claim === "skip") {
     logger.info("settlePlayHandler: no-op (already claimed/settled or state moved on)", { gameId, playId });
     return;
   }
-  logger.info("settlePlayHandler: claimed", { gameId, playId });
+  if (claim === "recovering") {
+    logger.warn("settlePlayHandler: recovering a play stuck in settling", { gameId, playId });
+  } else {
+    logger.info("settlePlayHandler: claimed", { gameId, playId });
+  }
 
   const game = (await gameRef.get()).data() as Game | undefined;
   if (!game) throw new Error(`Game ${gameId} not found while settling ${playId}.`);
@@ -207,13 +236,31 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
   });
 
   const playerRefs = new Map(uids.map((uid) => [uid, gameRef.collection("players").doc(uid)] as const));
-  const playerSnaps = await Promise.all(uids.map((uid) => playerRefs.get(uid)!.get()));
+  // getAll batches every player read into one round trip instead of N
+  // separate gets.
+  const playerSnaps = uids.length > 0 ? await firestore.getAll(...uids.map((uid) => playerRefs.get(uid)!)) : [];
   const balances = new Map<string, number>(
     uids.map((uid, i) => [uid, (playerSnaps[i].data() as Player | undefined)?.balance ?? 0]),
   );
   const clampedWagers = new Map(
     uids.map((uid) => [uid, clampStakeToBalance(counted.get(uid)!, balances.get(uid)!)] as const),
   );
+  for (const uid of uids) {
+    const requested = counted.get(uid)!;
+    const clamped = clampedWagers.get(uid)!;
+    if (clamped.typeStake !== requested.typeStake || clamped.resultStake !== requested.resultStake) {
+      logger.warn("settlePlayHandler: stake clamped to balance", {
+        gameId,
+        playId,
+        uid,
+        requestedTypeStake: requested.typeStake,
+        requestedResultStake: requested.resultStake,
+        clampedTypeStake: clamped.typeStake,
+        clampedResultStake: clamped.resultStake,
+        balance: balances.get(uid),
+      });
+    }
+  }
 
   const summary = computeSettlement(clampedWagers, play.result!);
   logger.info("settlePlayHandler: settlement computed", {
@@ -226,7 +273,30 @@ export async function settlePlayHandler(firestore: Firestore, gameId: string, pl
     resultWinners: summary.resultWinners,
   });
 
-  for (const batchPlayers of chunk(summary.players, 200)) {
+  // Recovery guard (see the "recovering" claim above): a prior attempt may
+  // have already committed some of these per-player batches before dying.
+  // Balance is written as an absolute value derived from a balance read
+  // taken *this* invocation, so re-applying a player already paid out here
+  // would double-count their delta — unlike applyReportingLedger's
+  // increment-based writes, this can't just re-set the same value twice.
+  // Skip anyone whose settlement ledger entry (deterministic ID) already
+  // exists.
+  const alreadySettledSnap = await gameRef
+    .collection("ledger")
+    .where("playId", "==", playId)
+    .where("reason", "==", "settlement")
+    .get();
+  const alreadySettledUids = new Set(alreadySettledSnap.docs.map((d) => (d.data() as LedgerEntry).playerUid));
+  const pendingPlayers = summary.players.filter((p) => !alreadySettledUids.has(p.playerUid));
+  if (alreadySettledUids.size > 0) {
+    logger.warn("settlePlayHandler: skipping players already settled in a prior attempt", {
+      gameId,
+      playId,
+      alreadySettledCount: alreadySettledUids.size,
+    });
+  }
+
+  for (const batchPlayers of chunk(pendingPlayers, 200)) {
     const batch = firestore.batch();
     for (const p of batchPlayers) {
       const balanceAfter = (balances.get(p.playerUid) ?? 0) + p.delta;
@@ -376,22 +446,33 @@ export async function undoLastSettlementHandler(
     .where("reason", "in", ["settlement", "reporting_bonus", "reporting_penalty"])
     .get();
 
+  // Stats must be reversed using the wager that was actually *scored* at
+  // settlement — the latest revision at or before the stored cutoffAt — not
+  // simply each player's latest revision. A player is free to keep changing
+  // their pick after the play settles (it just opens a new play), so their
+  // "latest" revision by the time undo runs can differ from what was counted;
+  // using it here silently corrupted typeCorrect/typeWrong/resultCorrect.
+  if (!play.cutoffAt) throw new Error(`Play ${playId} has no cutoffAt; cannot recompute counted wagers for undo.`);
   const wagersSnap = await playRef.collection("wagers").get();
-  const latestWagerByPlayer = new Map<string, WagerRevision>();
-  for (const doc of wagersSnap.docs) {
+  const revisions = wagersSnap.docs.map((doc) => {
     const data = doc.data() as WagerRevision;
-    const existing = latestWagerByPlayer.get(data.playerUid);
-    if (!existing || data.placedAt.toMillis() > existing.placedAt.toMillis()) {
-      latestWagerByPlayer.set(data.playerUid, data);
-    }
-  }
+    return {
+      playerUid: data.playerUid,
+      typePick: data.typePick,
+      bucketPick: data.bucketPick,
+      typeStake: data.typeStake,
+      resultStake: data.resultStake,
+      placedAtMillis: data.placedAt.toMillis(),
+    };
+  });
+  const countedWagerByPlayer = selectCountedWagers(revisions, play.cutoffAt.toMillis());
 
   for (const batchDocs of chunk(ledgerSnap.docs, 200)) {
     const batch = firestore.batch();
     for (const doc of batchDocs) {
       const entry = doc.data() as LedgerEntry;
       if (entry.reason === "settlement") {
-        const wager = latestWagerByPlayer.get(entry.playerUid);
+        const wager = countedWagerByPlayer.get(entry.playerUid);
         const typeCorrect = wager?.typePick === play.result!.type;
         const resultCorrect = typeCorrect && wager?.bucketPick === play.result!.bucket;
         batch.update(gameRef.collection("players").doc(entry.playerUid), {
