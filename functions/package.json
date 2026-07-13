@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
+    "lint": "eslint src",
     "serve": "npm run build && firebase emulators:start --only functions,firestore,auth",
     "seed": "ts-node src/scripts/seedGame.ts",
     "e2e": "ts-node src/scripts/e2eCrowdGame.ts",
@@ -20,8 +21,11 @@
     "firebase-functions": "^7.2.5"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.7.0",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3",
+    "typescript-eslint": "^8.63.0",
     "vitest": "^4.1.9"
   },
   "overrides": {

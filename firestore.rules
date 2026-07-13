@@ -57,7 +57,7 @@ service cloud.firestore {
 
     // ---- games/{gameId} ---------------------------------------------
     // Game creation/config is an admin operation (console or an admin
-    // script — see scripts/seed-game.ts) for now. No client, operator
+    // script — see scripts/seedGame.ts) for now. No client, operator
     // included, writes top-level game fields; operatorUids and config
     // are trust anchors every other rule in this file reads from.
     match /games/{gameId} {
@@ -100,10 +100,18 @@ service cloud.firestore {
           (resource.data.state in ['open', 'locked']
             && request.resource.data.state == 'voided')
           ||
-          // Result entry: state unchanged, only `result` is being set.
+          // Result entry: state unchanged, `result` goes from unset to a
+          // config-valid value. A correction goes through UNDO (state
+          // returns to 'locked' with result cleared) rather than an
+          // overwrite here — settlePlay's trigger only reacts to result's
+          // first appearance, so a silent overwrite would show clients a
+          // result that was never actually scored.
           (resource.data.state == 'locked'
             && request.resource.data.state == 'locked'
-            && request.resource.data.result != null)
+            && resource.data.get('result', null) == null
+            && request.resource.data.result.type in ['run', 'pass']
+            && request.resource.data.result.bucket in
+                 game(gameId).config.buckets[request.resource.data.result.type])
         );
 
         allow delete: if false;
@@ -186,6 +194,11 @@ service cloud.firestore {
         // opens (scheduledStartAt − joinWindowSeconds); games without a
         // scheduledStartAt are joinable any time, as before.
         allow create: if isSelf(uid)
+          // DESIGN.md §8: an operator can't hold a stake in the game they
+          // run. The wager-create rule already blocks operators from
+          // wagering; this closes the doc itself so the restriction holds
+          // even if operatorUids is edited after the fact.
+          && !(uid in game(gameId).operatorUids)
           && request.resource.data.balance == game(gameId).config.grubstake
           && request.resource.data.stats.typeBets == 0
           && request.resource.data.stats.typeCorrect == 0

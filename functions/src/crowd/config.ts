@@ -50,6 +50,41 @@ export const CROWD_DEFAULTS: CrowdConfig = {
   stakeConcentrationCapFraction: 0.25,
 };
 
+/**
+ * Bounds-checks the subset of GameConfig that scheduleGame accepts from a
+ * caller (§12.10). Only the core fields are checked here — crowd tunables
+ * default sanely via resolveCrowdConfig and aren't operator-facing yet.
+ * Returns a human-readable reason, or null if the partial config is
+ * acceptable to merge over the defaults.
+ */
+export function validateGameConfig(config: Partial<GameConfig>): string | null {
+  if (config.lockWindowSeconds !== undefined) {
+    if (!Number.isFinite(config.lockWindowSeconds) || config.lockWindowSeconds < 5 || config.lockWindowSeconds > 60) {
+      return "lockWindowSeconds must be between 5 and 60.";
+    }
+  }
+  if (config.grubstake !== undefined) {
+    if (!Number.isInteger(config.grubstake) || config.grubstake < 1) {
+      return "grubstake must be a positive integer.";
+    }
+  }
+  if (config.minStake !== undefined) {
+    if (!Number.isInteger(config.minStake) || config.minStake < 1) {
+      return "minStake must be a positive integer.";
+    }
+  }
+  if (config.buckets !== undefined) {
+    const { run, pass } = config.buckets;
+    if (!Array.isArray(run) || run.length === 0 || !run.every((b) => typeof b === "string" && b.length > 0)) {
+      return "buckets.run must be a non-empty array of strings.";
+    }
+    if (!Array.isArray(pass) || pass.length === 0 || !pass.every((b) => typeof b === "string" && b.length > 0)) {
+      return "buckets.pass must be a non-empty array of strings.";
+    }
+  }
+  return null;
+}
+
 export function resolveCrowdConfig(config: GameConfig): CrowdConfig {
   return {
     crowdMode: config.crowdMode ?? CROWD_DEFAULTS.crowdMode,

@@ -7,12 +7,17 @@ its own repo because it's a different toolchain (TypeScript/Node vs. the
 Android app's Kotlin/Gradle) with its own deploy path (`firebase deploy` vs.
 an app release) — see the design doc discussion for the tradeoffs.
 
-**Status: phases 2 and 3 deployed and live.** Settlement, void-advance, and
-undo Cloud Functions run against the real `out-coached` Firebase project on
-the Blaze plan; leaderboard recomputation and FCM game-live notifications
-(`notifications.ts`) are also deployed. Remaining work (DESIGN.md §9 step 4,
-a live dry run against a real broadcast) lives entirely on the Android/
-operator side — nothing further is planned for this repo before that.
+**Status: phases 2 and 3 deployed and live, plus the crowd-run backend
+(DESIGN.md §12 / PLAN.md CR-2).** Settlement, void-advance, and undo Cloud
+Functions run against the real `out-coached` Firebase project on the Blaze
+plan; leaderboard recomputation and FCM game-live notifications
+(`notifications.ts`) are also deployed. Crowd-run — snap/moment burst
+detection, type/result voting, holds, the monitor console's callables, and
+`scheduleGame` — is fully implemented and deployed alongside the
+operator-driven path (`crowdHandlers.ts`); which path a game uses is a
+per-game `config.crowdMode` setting. Remaining work (DESIGN.md §9 step 4, a
+live dry run against a real broadcast) lives entirely on the Android/operator
+side — nothing further is planned for this repo before that.
 
 The Android app also gained a monetization layer (AdMob ads, a one-time
 premium ad-removal purchase, GDPR/UMP consent — see the out-coached repo's
@@ -37,13 +42,18 @@ functions/                Cloud Functions (TypeScript)
   src/handlers.ts          settlePlay/advanceAfterVoid/undoLastSettlement logic
                             (+ the §12.4 reporting-accuracy ledger step)
   src/handlers.emulator.test.ts  Integration tests against the real Firestore emulator
+  src/notifications.ts     FCM game-live push (+ the isFirstGoingLive guard,
+                            which is unit-tested — sendGameLiveNotification
+                            itself isn't; no Messaging emulator exists)
+  src/notifications.test.ts  Unit tests for isFirstGoingLive
   src/crowd/               DESIGN.md §12 pure decision logic (no Firebase deps),
                             each with an exhaustive unit-test file:
     burst.ts                 §12.2 moment-signal burst detection
     consensus.ts             §12.3 vote tallying + finalize rule
     quorum.ts                §12.6 quorum scaling + margin acceptance
     reportingLedger.ts       §12.4 reward/penalty table
-    config.ts                §12.5 tunables + defaults resolver
+    config.ts                §12.5 tunables + defaults resolver + scheduleGame
+                              config validation
   src/crowdHandlers.ts     Crowd-run trigger logic: snap/kickoff/period bursts,
                             type/result votes, holds, sweep, scheduleGame,
                             monitor actions (PLAN.md CR-2)
@@ -51,9 +61,13 @@ functions/                Cloud Functions (TypeScript)
   src/index.ts             Thin trigger/callable wrappers around handlers + ping
   src/scripts/seedGame.ts  Dev-only emulator seed script
   src/scripts/grantMonitor.ts  Grants/revokes the §12.9 monitor custom claim
+  src/scripts/e2eCrowdGame.ts  Trigger-level e2e crowd game against the full
+                            emulator — not run in CI (slow, full-stack); run
+                            manually via `npm run e2e` after `firebase emulators:start`
+  eslint.config.mjs        ESLint flat config — `npm run lint`
 .github/workflows/
-  ci.yml                   Build + test on every PR
-  deploy.yml               Build + test + deploy on push to main
+  ci.yml                   Lint + build + test on every PR
+  deploy.yml               Lint + build + test + deploy on push to main
 ```
 
 ## CI/CD
@@ -81,13 +95,14 @@ cp ../.firebaserc.example ../.firebaserc   # then edit in your project id
 ## Testing
 
 ```
-npx vitest run          # pure math (settlement.ts) — instant, no emulator needed
-npm run test:emulator   # handlers.ts against a real Firestore emulator
+npm run lint             # ESLint (flat config, non-type-checked TS rules)
+npx vitest run           # pure math (settlement.ts) — instant, no emulator needed
+npm run test:emulator    # handlers.ts against a real Firestore emulator
 ```
 
 `test:emulator` requires **JDK 21+** (the Firestore emulator jar itself
-needs it — separate from whatever JDK you use for other projects). Both
-suites run in CI on every PR and before every deploy.
+needs it — separate from whatever JDK you use for other projects). All three
+run in CI on every PR and before every deploy.
 
 ## Local development (emulators)
 
@@ -117,5 +132,7 @@ firebase deploy --only firestore:rules,firestore:indexes,functions
 
 See DESIGN.md §9. Steps 1 (schema + rules), 2 (settlement Cloud Function,
 parimutuel math, ledger, refund/void/undo), and 3 (leaderboard recomputation,
-FCM game-start pings) are done and deployed. Step 4 (a live dry run against a
-real broadcast) is the only step left, and it doesn't touch this repo.
+FCM game-start pings) are done and deployed, as is the crowd-run backend
+(DESIGN.md §12 / PLAN.md CR-2 — see `crowdHandlers.ts`). Step 4 (a live dry
+run against a real broadcast) is the only step left, and it doesn't touch
+this repo.

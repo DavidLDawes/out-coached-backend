@@ -198,6 +198,49 @@ describe("settlePlayHandler", () => {
     await settlePlayHandler(db, GAME_ID, "0001");
     expect((await getPlayer("A")).balance).toBe(balanceAfterFirst);
   });
+
+  it("recovers a play stuck in 'settling' (simulated crash mid-settlement) without double-paying", async () => {
+    await seedGame();
+    await seedPlayer("A", 1000);
+    await seedPlayer("B", 1000);
+    await seedPlay("0001", {
+      state: "settling", // as if a prior invocation claimed it and then died
+      snapAt: ts(100_000),
+      result: { type: "run", bucket: "0" },
+    });
+    await seedWager("0001", "A", "run", "0", 100, 0, 80_000); // wins
+    await seedWager("0001", "B", "pass", "0", 100, 0, 80_000); // loses
+
+    // Simulate that A's payout was already committed by the dead attempt
+    // (deterministic ledger doc, absolute balance, incremented stats) but
+    // B's was not — a batch.commit() landed for A before the crash.
+    await db.doc(`games/${GAME_ID}/players/A`).update({
+      balance: 1100,
+      "stats.typeBets": 1,
+      "stats.typeCorrect": 1,
+    });
+    await db.doc(`games/${GAME_ID}/ledger/0001_A`).set({
+      delta: 100,
+      balanceAfter: 1100,
+      reason: "settlement",
+      playerUid: "A",
+      playId: "0001",
+      createdAt: ts(50_000),
+    });
+
+    await settlePlayHandler(db, GAME_ID, "0001");
+
+    // A must not be paid or scored a second time; B's payout must still land.
+    const playerA = await getPlayer("A");
+    expect(playerA.balance).toBe(1100);
+    expect(playerA.stats.typeBets).toBe(1);
+    const playerB = await getPlayer("B");
+    expect(playerB.balance).toBe(900);
+    expect(playerB.stats.typeBets).toBe(1);
+    expect(playerB.stats.typeWrong).toBe(1);
+    expect((await getPlay("0001")).state).toBe("settled");
+    expect((await getLedgerEntries("0001")).length).toBe(2);
+  });
 });
 
 describe("advanceAfterVoidHandler", () => {
@@ -243,7 +286,9 @@ describe("undoLastSettlementHandler", () => {
     await settleASimplePlay();
     const balanceABeforeUndo = (await getPlayer("A")).balance;
     const balanceBBeforeUndo = (await getPlayer("B")).balance;
-    expect(balanceABeforeUndo).not.toBe(1000); // sanity: settlement actually moved money
+    // Sanity: settlement actually moved money for both players.
+    expect(balanceABeforeUndo).not.toBe(1000);
+    expect(balanceBBeforeUndo).not.toBe(1000);
 
     const result = await undoLastSettlementHandler(db, GAME_ID, "0001", "op-1");
     expect(result.undone).toBe(2);
@@ -282,5 +327,45 @@ describe("undoLastSettlementHandler", () => {
     await db.doc(`games/${GAME_ID}/plays/0002`).update({ state: "locked", snapAt: ts(200_000) });
 
     await expect(undoLastSettlementHandler(db, GAME_ID, "0001", "op-1")).rejects.toThrow(/already progressed/);
+  });
+
+  it("reverses stats using the counted (pre-cutoff) wager, not whatever revision is latest", async () => {
+    // A's counted pick (run/"0", placed well before the cutoff) wins; A then
+    // changes their mind to pass/"sack" *after* the cutoff but before SNAP —
+    // legal (the play is still "open" until SNAP), and that later revision is
+    // what stands as "latest" even though it never counted for scoring.
+    await seedGame({ currentPlayId: "0001", operatorUids: ["op-1"] });
+    await seedPlayer("A", 1000);
+    await seedPlay("0001", {
+      state: "locked",
+      snapAt: ts(100_000), // cutoff = 100_000 - 10_000 = 90_000
+      result: { type: "run", bucket: "0" },
+    });
+    await seedWager("0001", "A", "run", "0", 100, 0, 80_000); // counted: correct pick
+    await seedWager("0001", "A", "pass", "sack", 100, 0, 95_000); // latest, but after cutoff: doesn't count
+
+    await settlePlayHandler(db, GAME_ID, "0001");
+    const settled = await getPlayer("A");
+    expect(settled.stats.typeCorrect).toBe(1); // scored on the counted (run) pick
+    expect(settled.stats.resultCorrect).toBe(1);
+
+    await undoLastSettlementHandler(db, GAME_ID, "0001", "op-1");
+
+    const undone = await getPlayer("A");
+    expect(undone.balance).toBe(1000);
+    expect(undone.stats.typeBets).toBe(0);
+    expect(undone.stats.typeCorrect).toBe(0);
+    expect(undone.stats.typeWrong).toBe(0);
+    expect(undone.stats.resultCorrect).toBe(0);
+  });
+
+  it("recomputes the public leaderboard doc to reflect the reversed stats", async () => {
+    await settleASimplePlay();
+    await undoLastSettlementHandler(db, GAME_ID, "0001", "op-1");
+
+    const leaderboard = await getLeaderboard();
+    expect(leaderboard?.topBalance.find((e) => e.uid === "A")?.balance).toBe(1000);
+    expect(leaderboard?.topBalance.find((e) => e.uid === "B")?.balance).toBe(1000);
+    expect(leaderboard?.accuracy.entries?.every((e) => e.wrong === 0)).toBe(true);
   });
 });

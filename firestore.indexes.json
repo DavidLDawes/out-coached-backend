@@ -7,6 +7,14 @@
         { "fieldPath": "playerUid", "order": "ASCENDING" },
         { "fieldPath": "placedAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "momentSignals",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "momentType", "order": "ASCENDING" },
+        { "fieldPath": "signaledAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

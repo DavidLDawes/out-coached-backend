@@ -13,7 +13,7 @@ import { logger } from "firebase-functions/v2";
 import { detectBurst, type SignalLike } from "./crowd/burst";
 import { evaluateVote, tallyVote, type ReportLike } from "./crowd/consensus";
 import { computeQuorum, evaluateAcceptance } from "./crowd/quorum";
-import { resolveCrowdConfig, CROWD_DEFAULTS, type CrowdConfig } from "./crowd/config";
+import { resolveCrowdConfig, validateGameConfig, CROWD_DEFAULTS, type CrowdConfig } from "./crowd/config";
 import { selectCountedWagers, type CountedWager } from "./settlement";
 import type {
   CrowdReport,
@@ -300,15 +300,29 @@ export async function handleReport(
   nowMillis: number = Date.now(),
 ): Promise<void> {
   const gameRef = firestore.doc(`games/${gameId}`);
-  const game = (await gameRef.get()).data() as Game | undefined;
-  if (!game) return;
+  const [game, play] = await Promise.all([
+    gameRef.get().then((s) => s.data() as Game | undefined),
+    gameRef
+      .collection("plays")
+      .doc(playId)
+      .get()
+      .then((s) => s.data() as Play | undefined),
+  ]);
+  if (!game || !play) return;
   const crowd = resolveCrowdConfig(game.config);
   if (crowd.crowdMode === "off") return;
 
-  const playRef = gameRef.collection("plays").doc(playId);
-  const play = (await playRef.get()).data() as Play | undefined;
-  if (!play) return;
+  // Every report write on this play — snap bursts especially — re-triggers
+  // this whole function, and a full reports-subcollection scan is the
+  // expensive part of each call. Gate on whether the play is even in a
+  // state a report could still act on *before* paying for that scan, so a
+  // stray trigger against an already-voided/settling/settled play (or the
+  // periodic sweep revisiting a concluded play) costs one doc read, not one
+  // plus a full subcollection scan.
+  const votePending = play.state === "locked" && !play.result && !!play.snapAt && !play.settlement?.reversedBy;
+  if (play.state !== "open" && !votePending) return;
 
+  const playRef = gameRef.collection("plays").doc(playId);
   const reportsSnap = await playRef.collection("reports").get();
   const reports = reportsSnap.docs.map((d) => d.data() as CrowdReport);
 
@@ -345,11 +359,9 @@ export async function handleReport(
   }
 
   // --- Type/result votes (§12.3) -------------------------------------------
-  if (play.state !== "locked" || play.result || !play.snapAt) return;
-  // A human reversed this play (undo) — the crowd stays out of re-entry.
-  if (play.settlement?.reversedBy) return;
-
-  const snapAtMillis = play.snapAt.toMillis();
+  // votePending (checked above) already guarantees locked, no result yet,
+  // snapAt present, and not undo-reversed.
+  const snapAtMillis = play.snapAt!.toMillis();
   const { counted } = await loadCountedWagers(firestore, gameId, playId, snapAtMillis, game.config);
 
   const flagReasons: string[] = [...(play.reportingFlag?.reasons ?? [])];
@@ -581,6 +593,10 @@ export async function scheduleGameHandler(
   }
   if (!Number.isFinite(args.scheduledStartAtMillis)) {
     throw new HttpsError("invalid-argument", "scheduledStartAtMillis is required.");
+  }
+  if (args.config) {
+    const configError = validateGameConfig(args.config);
+    if (configError) throw new HttpsError("invalid-argument", configError);
   }
 
   const gameRef = firestore.doc(`games/${args.gameId}`);

@@ -9,6 +9,16 @@
 
 import { getMessaging } from "firebase-admin/messaging";
 import { logger } from "firebase-functions/v2";
+import type { GameStatus } from "./types";
+
+/**
+ * True only for the game's *first* transition into "live" — not a crowd
+ * game's halftime -> live at the second-half snap, which would otherwise
+ * fire a second "come watch, it's starting" push mid-game.
+ */
+export function isFirstGoingLive(before: GameStatus | undefined, after: GameStatus | undefined): boolean {
+  return after === "live" && before !== "live" && before !== "halftime";
+}
 
 export async function sendGameLiveNotification(gameId: string): Promise<void> {
   await getMessaging().send({
