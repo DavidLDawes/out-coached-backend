@@ -79,7 +79,10 @@ project — authenticated via a dedicated GCP service account
 the `GCP_SA_KEY` repo secret. That service account holds exactly the roles
 Cloud Functions Gen2 deploys need (Firebase Admin, Cloud Functions Admin,
 Cloud Run Admin, Artifact Registry Admin, Eventarc Admin, Pub/Sub Admin,
-Cloud Build Editor, Service Account User, Storage Admin) — nothing broader.
+Cloud Build Editor, Service Account User, Storage Admin, **Cloud Scheduler
+Admin** — needed once a scheduled function exists, e.g. `crowdSweep`;
+without it, deploy succeeds for every other function but fails updating the
+Cloud Scheduler job a scheduled function is backed by) — nothing broader.
 Rotate the key via `gcloud iam service-accounts keys create` + re-running
 `gh secret set GCP_SA_KEY` if it's ever suspected compromised.
 
