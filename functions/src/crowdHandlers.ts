@@ -73,6 +73,68 @@ function momentApplies(game: Game, momentType: MomentType): boolean {
   }
 }
 
+/**
+ * Applies a single momentType's transition inside a transaction, re-checking
+ * the state gate at write time so concurrent callers (a burst trigger and a
+ * sweep re-evaluation, or an operator's forced kickoff racing a burst) can't
+ * double-apply. Returns whether it actually applied.
+ */
+async function applyMomentTransition(
+  firestore: Firestore,
+  gameId: string,
+  momentType: MomentType,
+  nowMillis: number,
+  crowd: CrowdConfig,
+): Promise<boolean> {
+  const gameRef = firestore.doc(`games/${gameId}`);
+  return await firestore.runTransaction(async (tx) => {
+    const snap = await tx.get(gameRef);
+    const current = snap.data() as Game | undefined;
+    if (!current || !momentApplies(current, momentType)) return false;
+
+    switch (momentType) {
+      case "kickoff": {
+        tx.update(gameRef, { status: "live" });
+        const firstPlayRef = gameRef.collection("plays").doc(current.currentPlayId);
+        tx.set(
+          firstPlayRef,
+          { state: "open", openedAt: FieldValue.serverTimestamp() },
+          { merge: true },
+        );
+        break;
+      }
+      case "end_q1":
+        tx.update(gameRef, { period: "Q2" });
+        break;
+      case "half":
+        tx.update(gameRef, { status: "halftime", period: "Q3" });
+        break;
+      case "end_q3":
+        tx.update(gameRef, { period: "Q4" });
+        break;
+      case "start_ot":
+      case "end_game":
+        // §12.9 — irreversible markers enter a grace/hold period instead of
+        // applying immediately; the sweep makes them permanent, the monitor
+        // can cancel.
+        tx.update(gameRef, {
+          endGameHoldUntil: Timestamp.fromMillis(nowMillis + crowd.endGameGraceSeconds * 1000),
+          endGameHoldType: momentType,
+        });
+        break;
+      case "commercial_enter":
+        // nowMillis (not serverTimestamp) so the stale-signal filter above
+        // compares like-for-like against signaledAt millis.
+        tx.update(gameRef, { adMode: "commercial", adModeChangedAt: Timestamp.fromMillis(nowMillis) });
+        break;
+      case "commercial_exit":
+        tx.update(gameRef, { adMode: "game", adModeChangedAt: Timestamp.fromMillis(nowMillis) });
+        break;
+    }
+    return true;
+  });
+}
+
 export async function handleMomentSignal(
   firestore: Firestore,
   gameId: string,
@@ -119,54 +181,42 @@ export async function handleMomentSignal(
     return;
   }
 
-  // Live: apply inside a transaction, re-checking the state gate so two
-  // concurrent trigger invocations can't double-apply.
-  await firestore.runTransaction(async (tx) => {
-    const snap = await tx.get(gameRef);
-    const current = snap.data() as Game | undefined;
-    if (!current || !momentApplies(current, momentType)) return;
-
-    switch (momentType) {
-      case "kickoff": {
-        tx.update(gameRef, { status: "live" });
-        const firstPlayRef = gameRef.collection("plays").doc(current.currentPlayId);
-        tx.set(
-          firstPlayRef,
-          { state: "open", openedAt: FieldValue.serverTimestamp() },
-          { merge: true },
-        );
-        break;
-      }
-      case "end_q1":
-        tx.update(gameRef, { period: "Q2" });
-        break;
-      case "half":
-        tx.update(gameRef, { status: "halftime", period: "Q3" });
-        break;
-      case "end_q3":
-        tx.update(gameRef, { period: "Q4" });
-        break;
-      case "start_ot":
-      case "end_game":
-        // §12.9 — irreversible markers enter a grace/hold period instead of
-        // applying immediately; the sweep makes them permanent, the monitor
-        // can cancel.
-        tx.update(gameRef, {
-          endGameHoldUntil: Timestamp.fromMillis(nowMillis + crowd.endGameGraceSeconds * 1000),
-          endGameHoldType: momentType,
-        });
-        break;
-      case "commercial_enter":
-        // nowMillis (not serverTimestamp) so the stale-signal filter above
-        // compares like-for-like against signaledAt millis.
-        tx.update(gameRef, { adMode: "commercial", adModeChangedAt: Timestamp.fromMillis(nowMillis) });
-        break;
-      case "commercial_exit":
-        tx.update(gameRef, { adMode: "game", adModeChangedAt: Timestamp.fromMillis(nowMillis) });
-        break;
-    }
-  });
+  await applyMomentTransition(firestore, gameId, momentType, nowMillis, crowd);
   logger.info("handleMomentSignal: applied", { gameId, momentType, burstAt });
+}
+
+/**
+ * §7.2/§12.10 — operator-forced moment (currently just KICKOFF from the
+ * operator console). Operator authority, not a crowd vote: applies
+ * immediately regardless of crowdMode (shadow or live) and bypasses burst
+ * quorum entirely, the same way SNAP/result-entry are direct operator
+ * actions rather than crowd-tallied ones. Still state-gated by
+ * momentApplies via applyMomentTransition, so it's a no-op (not an error)
+ * if the moment no longer applies by the time it runs.
+ */
+export async function operatorForceMomentHandler(
+  firestore: Firestore,
+  gameId: string,
+  momentType: MomentType,
+  callerUid: string,
+): Promise<void> {
+  const gameRef = firestore.doc(`games/${gameId}`);
+  const game = (await gameRef.get()).data() as Game | undefined;
+  if (!game) {
+    throw new HttpsError("not-found", `Game ${gameId} not found.`);
+  }
+  if (!game.operatorUids?.includes(callerUid)) {
+    throw new HttpsError("permission-denied", "Only this game's operator may force a moment.");
+  }
+  const crowd = resolveCrowdConfig(game.config);
+  if (crowd.crowdMode === "off") {
+    throw new HttpsError("failed-precondition", "This game isn't crowd-run.");
+  }
+  const applied = await applyMomentTransition(firestore, gameId, momentType, Date.now(), crowd);
+  if (!applied) {
+    throw new HttpsError("failed-precondition", `${momentType} isn't valid in the game's current state.`);
+  }
+  logger.info("operatorForceMomentHandler: applied", { gameId, momentType, by: callerUid });
 }
 
 // ---------------------------------------------------------------------------

@@ -10,12 +10,13 @@ import {
   handleMomentSignal,
   handleReport,
   monitorVoidPlayHandler,
+  operatorForceMomentHandler,
   scheduleGameHandler,
   sweepCrowdGames,
   type ScheduleGameArgs,
 } from "./crowdHandlers";
 import { isFirstGoingLive, sendGameLiveNotification } from "./notifications";
-import type { Game, MomentSignal, Play } from "./types";
+import type { Game, MomentSignal, MomentType, Play } from "./types";
 
 initializeApp();
 
@@ -194,6 +195,22 @@ export const monitorVoidPlay = onCall(async (request) => {
 
   logger.info("monitorVoidPlay called", { gameId, playId, uid });
   await monitorVoidPlayHandler(getFirestore(), gameId, playId, request.auth?.token?.monitor === true);
+});
+
+/**
+ * §7.2/§12.10 — operator console: force a moment (currently just KICKOFF)
+ * immediately, bypassing crowd burst quorum. Operator authority, checked
+ * against this game's operatorUids inside the handler — no custom claim
+ * needed since operatorUids is already the per-game trust anchor.
+ */
+export const operatorForceMoment = onCall(async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign-in required.");
+  const { gameId, momentType } = (request.data ?? {}) as { gameId?: string; momentType?: MomentType };
+  if (!gameId || !momentType) throw new HttpsError("invalid-argument", "gameId and momentType are required.");
+
+  logger.info("operatorForceMoment called", { gameId, momentType, uid });
+  await operatorForceMomentHandler(getFirestore(), gameId, momentType, uid);
 });
 
 /**
